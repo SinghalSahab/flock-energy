@@ -1,6 +1,7 @@
 # Secrets and environment
 .env
 *.env.local
+scratch/
 
 # Python
 __pycache__/
