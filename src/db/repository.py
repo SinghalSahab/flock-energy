@@ -1,6 +1,7 @@
 import json
 import math
 import sqlite3
+import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.models.meter import Meter, GeoLocation
@@ -27,18 +28,19 @@ class SqliteRepository:
 
     def __init__(self, db_path: str = ":memory:"):
         self.db_path = db_path
+        self._lock = threading.Lock()
+        # For in-memory database, hold an open connection so data persists across calls
+        self._conn = sqlite3.connect(
+            self.db_path,
+            check_same_thread=False
+        )
+        self._conn.row_factory = sqlite3.Row
+        self._conn.create_function("haversine_km", 4, haversine_distance_km)
         self._init_db()
 
-    def _get_connection(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        # Register custom Haversine function for geospatial SQL queries
-        conn.create_function("haversine_km", 4, haversine_distance_km)
-        return conn
-
     def _init_db(self) -> None:
-        with self._get_connection() as conn:
-            conn.execute("""
+        with self._lock:
+            self._conn.execute("""
                 CREATE TABLE IF NOT EXISTS meters (
                     id TEXT PRIMARY KEY,
                     serial_number TEXT,
@@ -56,16 +58,17 @@ class SqliteRepository:
                     raw_json TEXT
                 )
             """)
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_meters_make ON meters(make)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_meters_phase ON meters(phase)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_meters_status ON meters(status)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_meters_dt ON meters(dt_code)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_meters_feeder ON meters(feeder_code)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_meters_coords ON meters(latitude, longitude)")
+            self._conn.execute("CREATE INDEX IF NOT EXISTS idx_meters_make ON meters(make)")
+            self._conn.execute("CREATE INDEX IF NOT EXISTS idx_meters_phase ON meters(phase)")
+            self._conn.execute("CREATE INDEX IF NOT EXISTS idx_meters_status ON meters(status)")
+            self._conn.execute("CREATE INDEX IF NOT EXISTS idx_meters_dt ON meters(dt_code)")
+            self._conn.execute("CREATE INDEX IF NOT EXISTS idx_meters_feeder ON meters(feeder_code)")
+            self._conn.execute("CREATE INDEX IF NOT EXISTS idx_meters_coords ON meters(latitude, longitude)")
+            self._conn.commit()
 
     def upsert_meters(self, meters: List[Meter]) -> None:
         """Batch upsert normalized meters into the SQLite index."""
-        with self._get_connection() as conn:
+        with self._lock:
             records = []
             for m in meters:
                 lat = m.location.latitude if m.location else None
@@ -91,18 +94,19 @@ class SqliteRepository:
                     m.model_dump_json()
                 ))
 
-            conn.executemany("""
+            self._conn.executemany("""
                 INSERT OR REPLACE INTO meters (
                     id, serial_number, make, phase, status, install_type,
                     build_version, dt_code, feeder_code, substation_code,
                     zone_code, latitude, longitude, raw_json
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, records)
+            self._conn.commit()
 
     def get_by_id(self, meter_id: str) -> Optional[Meter]:
         """Fetch single meter by ID."""
-        with self._get_connection() as conn:
-            row = conn.execute("SELECT raw_json FROM meters WHERE id = ?", (meter_id,)).fetchone()
+        with self._lock:
+            row = self._conn.execute("SELECT raw_json FROM meters WHERE id = ?", (meter_id,)).fetchone()
             if not row:
                 return None
             return Meter.model_validate_json(row["raw_json"])
@@ -159,12 +163,11 @@ class SqliteRepository:
                 params.extend([near_lat, near_lng, radius_km])
 
         where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-
         count_sql = f"SELECT COUNT(*) as cnt FROM meters {where_clause}"
 
-        with self._get_connection() as conn:
+        with self._lock:
             # Get total matching count
-            total = conn.execute(count_sql, params).fetchone()["cnt"]
+            total = self._conn.execute(count_sql, params).fetchone()["cnt"]
 
             # Select data
             if is_geo:
@@ -176,7 +179,7 @@ class SqliteRepository:
                     LIMIT ? OFFSET ?
                 """
                 query_params = [near_lat, near_lng] + params + [limit, offset]
-                rows = conn.execute(select_sql, query_params).fetchall()
+                rows = self._conn.execute(select_sql, query_params).fetchall()
                 meters = []
                 for r in rows:
                     m = Meter.model_validate_json(r["raw_json"])
@@ -193,10 +196,11 @@ class SqliteRepository:
                     LIMIT ? OFFSET ?
                 """
                 query_params = params + [limit, offset]
-                rows = conn.execute(select_sql, query_params).fetchall()
+                rows = self._conn.execute(select_sql, query_params).fetchall()
                 meters = [Meter.model_validate_json(r["raw_json"]) for r in rows]
                 return meters, total
 
     def count(self) -> int:
-        with self._get_connection() as conn:
-            return conn.execute("SELECT COUNT(*) as cnt FROM meters").fetchone()["cnt"]
+        with self._lock:
+            return self._conn.execute("SELECT COUNT(*) as cnt FROM meters").fetchone()["cnt"]
+
