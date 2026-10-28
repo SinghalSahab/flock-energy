@@ -1,0 +1,5 @@
+{
+  "type": "redirect",
+  "status": 303,
+  "location": "/meters"
+}
