@@ -58,3 +58,26 @@
 - **Trade-offs / consequences:** Slight CPU parsing cost during data ingestion, handled transparently by Pydantic models.
 - **Files affected:** `src/models/meter.py`, `src/models/consumption.py`, `src/models/hierarchy.py`
 
+## D-006: SQLite Connection Lifecycle in Multi-Threaded Environments
+- **Date/step:** Phase 3 / Implementation & Testing
+- **Context:** Python's `sqlite3.connect(":memory:")` creates a distinct, isolated in-memory database for every call if closed. Initial tests failed because table creation and data insertion occurred in separate transient connections.
+- **Options considered:**
+  - Option A: Write to a temporary file on disk (pro: works across connections; con: disk I/O, cleanup overhead).
+  - Option B: Maintain a persistent connection object on `SqliteRepository` with `check_same_thread=False` and a `threading.Lock` (pro: blazingly fast in-memory execution, thread-safe for FastAPI worker threads, clean; con: single-process memory scope).
+- **Decision:** Option B. Maintain a thread-locked persistent connection inside `SqliteRepository`.
+- **Reason:** Keeps the entire index in memory with sub-millisecond query latency while maintaining full thread safety across FastAPI concurrent request threads.
+- **Trade-offs / consequences:** If the application process restarts, the index is re-populated from the portal in ~500ms on startup.
+- **Files affected:** `src/db/repository.py`
+
+## D-007: Geospatial Distance Calculation via Registered SQLite Haversine Function
+- **Date/step:** Phase 3 / Implementation
+- **Context:** The assignment encouraged a query layer enabling "near this location" queries. Standard SQLite does not include native spatial math functions (like `sin`, `cos`, `radians`) out of the box.
+- **Options considered:**
+  - Option A: Pull all meters into Python memory and sort in Python (pro: simple; con: poor scalability if dataset grew to hundreds of thousands of meters).
+  - Option B: Register a custom Haversine distance function `haversine_km(lat1, lon1, lat2, lon2)` directly into SQLite via `connection.create_function` (pro: push filtering and sorting into SQL query planner, returns pre-sorted and distance-annotated records; con: non-standard SQLite function dependent on the Python driver).
+- **Decision:** Option B. Register custom Haversine UDF on the connection.
+- **Reason:** Enables SQL queries like `WHERE haversine_km(latitude, longitude, :lat, :lng) <= :radius ORDER BY distance_km ASC LIMIT :limit OFFSET :offset`.
+- **Trade-offs / consequences:** For massive datasets (>100k meters), a bounding-box pre-filter (`latitude BETWEEN min_lat AND max_lat`) or Spatialite/R*Tree index would be needed to prevent full table scans.
+- **Files affected:** `src/db/repository.py`, `src/api/routes/meters.py`
+
+
